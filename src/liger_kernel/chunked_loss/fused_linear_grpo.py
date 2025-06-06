@@ -24,6 +24,7 @@ class LigerFusedLinearGRPOBase(torch.autograd.Function):
         tokens_log_prob,
         tokens_mask,
         advantages,
+        bias=None,
         epsilon=0.2,
         max_seq_len=1024,
         compiled=True,
@@ -40,6 +41,7 @@ class LigerFusedLinearGRPOBase(torch.autograd.Function):
             tokens_log_prob: Old policy log probabilities tensor [B, T]
             tokens_mask: Response mask tensor [B, T]
             advantages: Advantages tensor [B]
+            bias: Bias tensor [V] (optional)
             epsilon: Clipping parameter for importance sampling ratio
             max_seq_len: Maximum sequence length for normalization
             compiled: Whether to use torch compile
@@ -49,6 +51,7 @@ class LigerFusedLinearGRPOBase(torch.autograd.Function):
         loss_acc = torch.zeros((), device=_input.device, dtype=torch.float32)
         grad_weight = torch.zeros_like(weight)  # [V, H]
         grad_inputs = []
+        grad_bias = torch.zeros_like(bias) if bias is not None else None  # [V]
         aggregated_metrics = []
 
         # Create a partial function with fixed arguments
@@ -66,13 +69,15 @@ class LigerFusedLinearGRPOBase(torch.autograd.Function):
             tokens_mask_chunk,
         ):
             """Fused forward and backward for a chunk."""
-            return torch.func.grad_and_value(compute_loss, argnums=(0, 1), has_aux=True)(
+            argnums = (0, 1, 6) if bias is not None else (0, 1)
+            return torch.func.grad_and_value(compute_loss, argnums=argnums, has_aux=True)(
                 input_chunk,  # arg 0
                 weight,  # arg 1
                 tokens_chunk,  # arg 2
                 tokens_log_prob_chunk,  # arg 3
                 tokens_mask_chunk,  # arg 4
                 advantages,  # arg 5
+                bias,  # arg 6
             )
 
         def accumulate_chunk(
@@ -81,12 +86,14 @@ class LigerFusedLinearGRPOBase(torch.autograd.Function):
             tokens_log_prob_chunk,
             tokens_mask_chunk,
         ):
-            (chunk_grad_input, chunk_grad_weight), (chunk_loss, chunk_metrics) = fused_fwd_bwd(
+            (chunk_grad_input, chunk_grad_weight, *chunk_grad_bias), (chunk_loss, chunk_metrics) = fused_fwd_bwd(
                 input_chunk,
                 tokens_chunk,
                 tokens_log_prob_chunk,
                 tokens_mask_chunk,
             )
+            if bias is not None:
+                grad_bias.add_(chunk_grad_bias[0])
 
             # this part makes no difference for batch dim chunking or sequence dim chunking
             # Accumulate gradients and loss
@@ -147,7 +154,7 @@ class LigerFusedLinearGRPOBase(torch.autograd.Function):
         grad_input = torch.cat(grad_inputs, dim=1)
 
         # Save for backward
-        ctx.save_for_backward(grad_input, grad_weight)
+        ctx.save_for_backward(grad_input, grad_weight, grad_bias)
 
         # Finalize metrics
         final_metrics = []
@@ -167,13 +174,14 @@ class LigerFusedLinearGRPOBase(torch.autograd.Function):
         tokens_log_prob_chunk,
         tokens_mask_chunk,
         advantages,
+        bias=None,
         epsilon=0.2,
         max_seq_len=1024,
         grpo_loss_fn=None,
     ):
         """Compute loss for a single chunk."""
         # Get policy log probabilities using chunk_forward
-        log_probs, _ = LigerFusedLinearGRPOBase.chunk_forward(input_chunk, weight)
+        log_probs, _ = LigerFusedLinearGRPOBase.chunk_forward(input_chunk, weight, bias=bias)
 
         # Compute chunk loss and metrics using the provided loss function  
         chunk_loss, chunk_metrics = grpo_loss_fn(
@@ -189,11 +197,12 @@ class LigerFusedLinearGRPOBase(torch.autograd.Function):
         return chunk_loss, chunk_metrics
 
     @staticmethod
-    def chunk_forward(input_chunk, weight):
+    def chunk_forward(input_chunk, weight, bias=None):
         """Forward pass computation for a single chunk without explicit reshaping."""
         # Directly compute logits via batched matrix multiplication: [B, T, H] @ [H, V] -> [B, T, V]
         logits = torch.matmul(input_chunk, weight.t())
-
+        if bias is not None:
+            logits = logits + bias  # Broadcasts bias to [B, T, V]
         # Compute log probabilities using softmax over the last dimension
         log_probs = F.log_softmax(logits.float(), dim=-1)
 
@@ -202,7 +211,7 @@ class LigerFusedLinearGRPOBase(torch.autograd.Function):
     @staticmethod
     def backward(ctx, grad_output, *grad_metrics):
         """Backward pass for GRPO loss."""
-        grad_input, grad_weight = ctx.saved_tensors
+        grad_input, grad_weight, grad_bias = ctx.saved_tensors
 
         if grad_output != 1.0:
             grad_input = grad_input * grad_output
@@ -215,6 +224,7 @@ class LigerFusedLinearGRPOBase(torch.autograd.Function):
             None,  # grad_tokens_log_prob
             None,  # grad_tokens_mask
             None,  # grad_advantages
+            grad_bias,  # grad_bias
             None,  # grad_epsilon
             None,  # grad_max_seq_len
             None,  # grad_compiled
@@ -269,6 +279,7 @@ class LigerFusedLinearGRPOFunction(LigerFusedLinearGRPOBase):
         tokens_log_prob,
         tokens_mask,
         advantages,
+        bias=None,
         epsilon=0.2,
         max_seq_len=1024,
         compiled=True,
@@ -284,6 +295,7 @@ class LigerFusedLinearGRPOFunction(LigerFusedLinearGRPOBase):
             tokens_log_prob: Old policy log probabilities tensor [B, T]
             tokens_mask: Response mask tensor [B, T]
             advantages: Advantages tensor [B]
+            bias: Bias tensor [V] (optional)
             epsilon: Clipping parameter for importance ratio
             max_seq_len: Maximum sequence length for normalization
             compiled: Whether to use torch compile
@@ -302,6 +314,7 @@ class LigerFusedLinearGRPOFunction(LigerFusedLinearGRPOBase):
             tokens_log_prob=tokens_log_prob,
             tokens_mask=tokens_mask,
             advantages=advantages,
+            bias=bias,
             epsilon=epsilon,
             max_seq_len=max_seq_len,
             compiled=compiled,
@@ -347,6 +360,7 @@ class LigerFusedLinearGRPOLoss(torch.nn.Module):
         tokens_log_prob,
         tokens_mask,
         advantages,
+        bias=None,
     ):
         """
         Forward pass for GRPO loss computation.
@@ -369,6 +383,7 @@ class LigerFusedLinearGRPOLoss(torch.nn.Module):
             tokens_log_prob,
             tokens_mask,
             advantages,
+            bias,
             self.epsilon,
             self.max_seq_len,
             self.compiled,

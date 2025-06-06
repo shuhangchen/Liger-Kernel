@@ -97,6 +97,7 @@ class LigerLMHeadGRPO(torch.nn.Module):
             tokens_log_prob,  # tokens_log_prob
             tokens_mask,  # tokens_mask
             advantages,  # advantages
+            bias=self.lin.bias,
         )
 
 
