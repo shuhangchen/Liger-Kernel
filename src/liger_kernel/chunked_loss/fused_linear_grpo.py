@@ -57,6 +57,7 @@ class LigerFusedLinearGRPOBase(torch.autograd.Function):
         # Create a partial function with fixed arguments
         compute_loss = partial(
             LigerFusedLinearGRPOBase._compute_chunk_loss,
+            advantages=advantages, # no chunks for advantages yet since we plan to chunk in sequence dim
             epsilon=epsilon,
             max_seq_len=max_seq_len,
             grpo_loss_fn=cls.grpo_loss_fn,
@@ -67,18 +68,16 @@ class LigerFusedLinearGRPOBase(torch.autograd.Function):
             tokens_chunk,
             tokens_log_prob_chunk,
             tokens_mask_chunk,
-            advantages_chunk,
         ):
             """Fused forward and backward for a chunk."""
-            argnums = (0, 1, 5) if bias is not None else (0, 1)
+            argnums = (0, 1, 4) if bias is not None else (0, 1)
             return torch.func.grad_and_value(compute_loss, argnums=argnums, has_aux=True)(
                 input_chunk,  # arg 0
                 weight,  # arg 1
                 tokens_chunk,  # arg 2
                 tokens_log_prob_chunk,  # arg 3
                 tokens_mask_chunk,  # arg 4
-                advantages_chunk,  # arg 5
-                bias,  # arg 6
+                bias,  # arg 5
             )
 
         def accumulate_chunk(
@@ -86,14 +85,12 @@ class LigerFusedLinearGRPOBase(torch.autograd.Function):
             tokens_chunk,
             tokens_log_prob_chunk,
             tokens_mask_chunk,
-            advantages_chunk,
         ):
             (chunk_grad_input, chunk_grad_weight, *chunk_grad_bias), (chunk_loss, chunk_metrics) = fused_fwd_bwd(
                 input_chunk,
                 tokens_chunk,
                 tokens_log_prob_chunk,
                 tokens_mask_chunk,
-                advantages_chunk,
             )
             if bias is not None:
                 grad_bias.add_(chunk_grad_bias[0])
@@ -121,13 +118,12 @@ class LigerFusedLinearGRPOBase(torch.autograd.Function):
             fused_fwd_bwd = torch.compile(fused_fwd_bwd)
 
         # Process input in chunks based on chunk_size
-        chunks = max(1, _input.shape[0] // chunk_size)
-        _input_chunks = torch.chunk(_input, chunks=chunks, dim=0)
-        _tokens_chunks = torch.chunk(tokens, chunks=chunks, dim=0)
-        _tokens_mask_chunks = torch.chunk(tokens_mask, chunks=chunks, dim=0)
-        _advantages_chunks = torch.chunk(advantages, chunks=chunks, dim=0)
+        chunks = max(1, _input.shape[1] // chunk_size)
+        _input_chunks = torch.chunk(_input, chunks=chunks, dim=1)
+        _tokens_chunks = torch.chunk(tokens, chunks=chunks, dim=1)
+        _tokens_mask_chunks = torch.chunk(tokens_mask, chunks=chunks, dim=1)
         _tokens_log_prob_chunks = (
-            torch.chunk(tokens_log_prob, chunks=chunks, dim=0)
+            torch.chunk(tokens_log_prob, chunks=chunks, dim=1)
             if tokens_log_prob is not None
             else [None] * chunks
         )
@@ -137,13 +133,11 @@ class LigerFusedLinearGRPOBase(torch.autograd.Function):
             tokens_chunk,
             tokens_log_prob_chunk,
             tokens_mask_chunk,
-            advantages_chunk,
         ) in zip(
             _input_chunks,
             _tokens_chunks,
             _tokens_log_prob_chunks,
             _tokens_mask_chunks,
-            _advantages_chunks,
         ):
             # Mark dynamic dimensions
             torch._dynamo.mark_dynamic(input_chunk, 1)
@@ -157,11 +151,10 @@ class LigerFusedLinearGRPOBase(torch.autograd.Function):
                 tokens_chunk,
                 tokens_log_prob_chunk,
                 tokens_mask_chunk,
-                advantages_chunk,
             )
 
         # Combine gradients
-        grad_input = torch.cat(grad_inputs, dim=0)
+        grad_input = torch.cat(grad_inputs, dim=1)
 
         # Save for backward
         ctx.save_for_backward(grad_input, grad_weight, grad_bias)
@@ -170,7 +163,7 @@ class LigerFusedLinearGRPOBase(torch.autograd.Function):
         final_metrics = []
         for metric in aggregated_metrics:
             if isinstance(metric, list):
-                final_metrics.append(torch.cat(metric, dim=0))
+                final_metrics.append(torch.cat(metric, dim=1))
             else:
                 final_metrics.append(metric)
 
@@ -183,7 +176,7 @@ class LigerFusedLinearGRPOBase(torch.autograd.Function):
         tokens_chunk,
         tokens_log_prob_chunk,
         tokens_mask_chunk,
-        advantages_chunk,
+        advantages,
         bias=None,
         epsilon=0.2,
         max_seq_len=1024,
@@ -199,7 +192,7 @@ class LigerFusedLinearGRPOBase(torch.autograd.Function):
             tokens=tokens_chunk,
             tokens_log_prob=tokens_log_prob_chunk,
             tokens_mask=tokens_mask_chunk,
-            advantages=advantages_chunk,
+            advantages=advantages, # no chunks for advantages yet since we plan to chunk in sequence dim
             epsilon=epsilon,
             max_seq_len=max_seq_len,
         )
@@ -267,8 +260,6 @@ class LigerFusedLinearGRPOFunction(LigerFusedLinearGRPOBase):
             index=tokens.unsqueeze(-1),
         ).squeeze(-1)  # (batch_size, seq_len)
 
-       
-
         # importance-sampling ratio and clipped ratio
         prob_ratio = torch.exp(current_log_probs - tokens_log_prob)
         clipped = torch.clamp(prob_ratio, 1.0 - epsilon, 1.0 + epsilon)
@@ -326,7 +317,10 @@ class LigerFusedLinearGRPOLoss(torch.nn.Module):
     ):
         """
         Forward pass for GRPO loss computation.
-        
+
+        Notes:
+            - tokens, tokens_log_prob, tokens_mask should already be aligned
+         
         Args:
             _input: Input embeddings [B, T, H]
             lin_weight: Linear layer weight [V, H]
