@@ -100,7 +100,7 @@ class LigerLMHeadGRPO(torch.nn.Module):
             bias=self.lin.bias,
         )
 
-def test():
+def test_correctness():
     """Single test case for GRPO loss correctness with fixed parameters."""
     # Fixed test parameters
     B, T, H, V = 8, 128, 1024, 4096 # batch, seq_len, hidden_size, vocab_size
@@ -205,5 +205,105 @@ def test():
         rtol=rtol,
     )
 
+def test_functional_correctness():
+    """Single test case for GRPO functional correctness with fixed parameters."""
+    # Fixed test parameters
+    B, T, H, V = 8, 128, 1024, 4096 # batch, seq_len, hidden_size, vocab_size
+    scalar = 1.0
+    dtype = torch.float32
+    atol, rtol = 1e-5, 1e-4
+    epsilon = 0.2
+    max_seq_len = 1024
+    bias = True
+    
+    # Reset torch compiler cache for each parameter of the test case
+    torch.compiler.reset()
+
+    # Create inputs with shape [B, T, H]
+    _input = torch.randn(B, T, H, device=device, dtype=dtype) * scalar
+    input1 = _input.detach().clone().requires_grad_(True)
+    input2 = _input.detach().clone().requires_grad_(True)
+
+    # Create weight tensors
+    _weight = torch.randn(V, H, device=device, dtype=dtype) * scalar
+    weight1 = _weight.detach().clone().requires_grad_(True)
+    weight2 = _weight.detach().clone().requires_grad_(True)
+
+    # Create selected token ids with shape [B, T]
+    tokens = torch.randint(0, V, (B, T), device=device)
+
+    # Create bias tensors if needed
+    if bias:
+        _bias = torch.randn(V, device=device, dtype=dtype) * scalar
+        bias1 = _bias.detach().clone().requires_grad_(True)
+        bias2 = _bias.detach().clone().requires_grad_(True)
+    else:
+        bias1 = None
+        bias2 = None
+
+    # Compute per-token logps
+    with torch.no_grad():
+        logits = _input @ _weight.t()
+        if bias:
+            logits = logits + _bias
+        logps = F.log_softmax(logits.float(), dim=-1)
+        per_token_logps = logps.gather(dim=-1, index=tokens.unsqueeze(-1)).squeeze(-1)
+
+    # Create attention mask with random padding [B, T]
+    tokens_mask = torch.ones(B, T, device=device)
+    num_elements_to_mask = torch.randint(1, B * T // 2, (1,)).item()
+    mask_indices = torch.randperm(B * T)[:num_elements_to_mask]
+    tokens_mask.view(-1)[mask_indices] = 0
+
+    # Create advantages with shape [B]
+    advantages = torch.rand(B, device=device, dtype=dtype)
+
+    # Call functional version
+    loss1, aux1 = liger_fused_linear_grpo(
+        input1,           # _input
+        weight1,          # weight
+        tokens,           # tokens
+        per_token_logps,  # tokens_log_prob
+        tokens_mask,      # tokens_mask
+        advantages,       # advantages
+        bias1,            # bias
+        epsilon,          # epsilon
+        max_seq_len,      # max_seq_len
+    )
+
+    # Call class apply version
+    loss2, aux2 = LigerFusedLinearGRPOFunction.apply(
+        input2,           # _input
+        weight2,          # weight
+        tokens,           # tokens
+        per_token_logps,  # tokens_log_prob
+        tokens_mask,      # tokens_mask
+        advantages,       # advantages
+        bias2,            # bias
+        epsilon,          # epsilon
+        max_seq_len,      # max_seq_len
+    )
+
+    # Check losses match
+    assert not torch.isnan(loss1)
+    assert not torch.isnan(loss2)
+    assert_verbose_allclose(loss1, loss2, atol=atol, rtol=rtol)
+
+    # Check metrics match
+    assert len(aux1) == len(aux2)
+    for metric1, metric2 in zip(aux1, aux2):
+        assert_verbose_allclose(metric1, metric2, atol=atol, rtol=rtol)
+
+    # Backward pass
+    loss1.backward()
+    loss2.backward()
+
+    # Check gradients match
+    assert_verbose_allclose(input1.grad, input2.grad, atol=atol, rtol=rtol)
+    assert_verbose_allclose(weight1.grad, weight2.grad, atol=atol, rtol=rtol)
+    if bias:
+        assert_verbose_allclose(bias1.grad, bias2.grad, atol=atol, rtol=rtol)
+
 if __name__ == "__main__":
-    test()
+    test_correctness()
+    test_functional_correctness()

@@ -56,7 +56,7 @@ class TorchLMHeadGRPO(torch.nn.Module):
         per_token_loss2 = coef_2 * advantages.unsqueeze(1)
         per_token_loss = -torch.min(per_token_loss1, per_token_loss2)
 
-        loss = (per_token_loss * tokens_mask).sum() / torch.clamp(tokens_mask.sum(), min=1.0)
+        loss = (per_token_loss * tokens_mask).sum().div(self.max_seq_len)
 
         return loss, []
 
@@ -116,23 +116,8 @@ class LigerLMHeadGRPO(torch.nn.Module):
     ],
 )
 @pytest.mark.parametrize("bias", [True, False])
-@pytest.mark.parametrize(
-    "beta, epsilon_low, epsilon_high, temperature",
-    [
-        # Standard settings
-        (0.1, 0.2, 0.2, 1.0),
-        (0.0, 0.1, 0.1, 2.0),
-    ],
-)
-@pytest.mark.parametrize(
-    "use_ref_model, use_ref_per_token_logps, old_per_token_logps",
-    [
-        (True, True, True),
-        (True, False, False),
-        (False, False, True),
-    ],
-)
-@pytest.mark.parametrize("loss_type", ["bnpo", "grpo", "dr_grpo"])
+@pytest.mark.parametrize("epsilon", [0.1, 0.2])
+@pytest.mark.parametrize("max_seq_len", [1024])
 def test_correctness(
     B,
     T,
