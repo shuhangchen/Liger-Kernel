@@ -106,7 +106,7 @@ def test():
     B, T, H, V = 8, 128, 1024, 4096 # batch, seq_len, hidden_size, vocab_size
     scalar = 1.0
     dtype = torch.float32
-    atol, rtol = 1e-3, 1e-2
+    atol, rtol = 1e-5, 1e-4
     epsilon = 0.2
     max_seq_len = 1024
     bias =True
