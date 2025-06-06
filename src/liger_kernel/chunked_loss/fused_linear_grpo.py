@@ -47,6 +47,19 @@ class LigerFusedLinearGRPOBase(torch.autograd.Function):
             compiled: Whether to use torch compile
             chunk_size: Size of chunks for processing
         """
+        print(f"cls: {cls}")
+        print(f"ctx: {ctx}")
+        print(f"_input shape: {_input.shape}")
+        print(f"weight shape: {weight.shape}")
+        print(f"tokens shape: {tokens.shape}")
+        print(f"tokens_log_prob shape: {tokens_log_prob.shape}")
+        print(f"tokens_mask shape: {tokens_mask.shape}")
+        print(f"advantages shape: {advantages.shape}")
+        print(f"bias shape: {bias.shape if bias is not None else None}")
+        print(f"epsilon: {epsilon}")
+        print(f"max_seq_len: {max_seq_len}")
+        print(f"compiled: {compiled}")
+        print(f"chunk_size: {chunk_size}")
         # Initialize accumulators
         loss_acc = torch.zeros((), device=_input.device, dtype=torch.float32)
         grad_weight = torch.zeros_like(weight)  # [V, H]
@@ -57,7 +70,6 @@ class LigerFusedLinearGRPOBase(torch.autograd.Function):
         # Create a partial function with fixed arguments
         compute_loss = partial(
             LigerFusedLinearGRPOBase._compute_chunk_loss,
-            advantages=advantages, # no chunks for advantages yet since we plan to chunk in sequence dim
             epsilon=epsilon,
             max_seq_len=max_seq_len,
             grpo_loss_fn=cls.grpo_loss_fn,
@@ -70,14 +82,15 @@ class LigerFusedLinearGRPOBase(torch.autograd.Function):
             tokens_mask_chunk,
         ):
             """Fused forward and backward for a chunk."""
-            argnums = (0, 1, 5) if bias is not None else (0, 1)
+            argnums = (0, 1, 6) if bias is not None else (0, 1)
             return torch.func.grad_and_value(compute_loss, argnums=argnums, has_aux=True)(
                 input_chunk,  # arg 0
                 weight,  # arg 1
                 tokens_chunk,  # arg 2
                 tokens_log_prob_chunk,  # arg 3
                 tokens_mask_chunk,  # arg 4
-                bias,  # arg 5
+                advantages,  # arg 5
+                bias,  # arg 6
             )
 
         def accumulate_chunk(
@@ -189,6 +202,7 @@ class LigerFusedLinearGRPOBase(torch.autograd.Function):
             tokens=tokens_chunk,
             tokens_log_prob=tokens_log_prob_chunk,
             tokens_mask=tokens_mask_chunk,
+            bias=bias,
             advantages=advantages, # no chunks for advantages yet since we plan to chunk in sequence dim
             epsilon=epsilon,
             max_seq_len=max_seq_len,
@@ -270,6 +284,58 @@ class LigerFusedLinearGRPOFunction(LigerFusedLinearGRPOBase):
         per_token_loss = per_token_loss * tokens_mask
         loss = per_token_loss.sum().div(max_seq_len)
         return loss, []
+    
+    @classmethod
+    def forward(
+        cls,
+        ctx,
+        _input,
+        weight,
+        tokens,
+        tokens_log_prob,
+        tokens_mask,
+        advantages,
+        bias=None,
+        epsilon=0.2,
+        max_seq_len=1024,
+        compiled=True,
+        chunk_size=1,
+    ):
+        """Fused forward pass for GRPO loss computation.
+
+        Args:
+            ctx: Context for backward
+            _input: Input tensor [B, T, H]
+            weight: Weight tensor [V, H]
+            tokens: Token ids tensor [B, T]
+            tokens_log_prob: Old policy log probabilities tensor [B, T]
+            tokens_mask: Response mask tensor [B, T]
+            advantages: Advantages tensor [B]
+            bias: Bias tensor [V] (optional)
+            epsilon: Clipping parameter for importance ratio
+            max_seq_len: Maximum sequence length for normalization
+            compiled: Whether to use torch compile
+            chunk_size: Size of chunks for memory-efficient processing
+
+        Returns:
+            loss: Computed loss
+            metrics: Computed metrics
+        """
+        return super().forward(
+            cls=cls,
+            ctx=ctx,
+            _input=_input,
+            weight=weight,
+            tokens=tokens,
+            tokens_log_prob=tokens_log_prob,
+            tokens_mask=tokens_mask,
+            advantages=advantages,
+            bias=bias,
+            epsilon=epsilon,
+            max_seq_len=max_seq_len,
+            compiled=compiled,
+            chunk_size=chunk_size,
+        )
 
 
 class LigerFusedLinearGRPOLoss(torch.nn.Module):
@@ -327,6 +393,7 @@ class LigerFusedLinearGRPOLoss(torch.nn.Module):
             advantages: Advantage values [B]
             bias: Linear layer bias [V] (optional)
         """
+        print(f"bias in torch nn module: {bias}")
         return LigerFusedLinearGRPOFunction.apply(
             _input,
             lin_weight,
