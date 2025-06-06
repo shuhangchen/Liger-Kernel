@@ -20,13 +20,12 @@ class TorchLMHeadGRPO(torch.nn.Module):
         H: int,
         V: int,
         dtype: torch.dtype,
-        bias: bool = False,
         beta: float = 0.1,
         epsilon: float = 0.2,
         max_seq_len: int = 1024,
     ):
         super().__init__()
-        self.lin = torch.nn.Linear(in_features=H, out_features=V, bias=bias, dtype=dtype)
+        self.lin = torch.nn.Linear(in_features=H, out_features=V, bias=False, dtype=dtype)
         self.beta = beta
         self.epsilon = epsilon
         self.max_seq_len = max_seq_len
@@ -40,8 +39,6 @@ class TorchLMHeadGRPO(torch.nn.Module):
         advantages,  # Shape: [batch_size,]
     ):
         logits = x @ self.lin.weight.t()
-        if self.lin.bias is not None:
-            logits = logits + self.lin.bias.float()
         # Get log probabilities
         log_probs = F.log_softmax(logits.float(), dim=-1)
 
@@ -67,12 +64,11 @@ class LigerLMHeadGRPO(torch.nn.Module):
         H: int,
         V: int,
         dtype: torch.dtype,
-        bias: bool = False,
         epsilon: float = 0.2,
         max_seq_len: int = 1024,
     ):
         super().__init__()
-        self.lin = torch.nn.Linear(in_features=H, out_features=V, bias=bias, dtype=dtype)
+        self.lin = torch.nn.Linear(in_features=H, out_features=V, bias=False, dtype=dtype)
         self.grpo_loss = LigerFusedLinearGRPOLoss(
             epsilon=epsilon,
             max_seq_len=max_seq_len,
@@ -97,7 +93,6 @@ class LigerLMHeadGRPO(torch.nn.Module):
             tokens_log_prob,  # tokens_log_prob
             tokens_mask,  # tokens_mask
             advantages,  # advantages
-            self.lin.bias,  # bias
         )
 
 def test():
@@ -107,7 +102,6 @@ def test():
     scalar = 1.0
     dtype = torch.float32
     atol, rtol = 1e-3, 1e-2
-    bias = False
     epsilon = 0.2
     max_seq_len = 1024
     
@@ -118,7 +112,6 @@ def test():
         H=H,
         V=V,
         dtype=dtype,
-        bias=bias,
         epsilon=epsilon,
         max_seq_len=max_seq_len,
     )
@@ -126,20 +119,17 @@ def test():
         H=H,
         V=V,
         dtype=dtype,
-        bias=bias,
         epsilon=epsilon,
         max_seq_len=max_seq_len,
     )
     
-    # Keep compilation disabled due to compiler error
-    liger_lm_head_grpo.grpo_loss.compiled = False
+    # Keep compilation disabled for now due to compiler error  
+    liger_lm_head_grpo.grpo_loss.compiled = True
 
     # Initialize weights
     torch_lm_head_grpo.lin.weight.data = liger_lm_head_grpo.lin.weight.data = torch.randn(
         V, H, device=device, dtype=dtype
     )
-    if bias:
-        torch_lm_head_grpo.lin.bias.data = liger_lm_head_grpo.lin.bias.data = torch.randn(V, device=device, dtype=dtype)
 
     # Create inputs with shape [B, T, H]
     _input = torch.randn(B, T, H, device=device, dtype=dtype) * scalar
@@ -152,8 +142,6 @@ def test():
     # Compute per-token logps
     with torch.no_grad():
         logits = _input @ torch_lm_head_grpo.lin.weight.t()
-        if torch_lm_head_grpo.lin.bias is not None:
-            logits = logits + torch_lm_head_grpo.lin.bias
         logps = F.log_softmax(logits.float(), dim=-1)
         per_token_logps = logps.gather(dim=-1, index=tokens.unsqueeze(-1)).squeeze(-1)
 
@@ -204,13 +192,6 @@ def test():
         atol=atol,
         rtol=rtol,
     )
-    if bias:
-        assert_verbose_allclose(
-            torch_lm_head_grpo.lin.bias.grad,
-            liger_lm_head_grpo.lin.bias.grad,
-            atol=atol,
-            rtol=rtol,
-        )
 
 if __name__ == "__main__":
     test()
