@@ -70,7 +70,7 @@ class LigerFusedLinearGRPOBase(torch.autograd.Function):
             tokens_mask_chunk,
         ):
             """Fused forward and backward for a chunk."""
-            argnums = (0, 1, 4) if bias is not None else (0, 1)
+            argnums = (0, 1, 5) if bias is not None else (0, 1)
             return torch.func.grad_and_value(compute_loss, argnums=argnums, has_aux=True)(
                 input_chunk,  # arg 0
                 weight,  # arg 1
@@ -95,6 +95,7 @@ class LigerFusedLinearGRPOBase(torch.autograd.Function):
             if bias is not None:
                 grad_bias.add_(chunk_grad_bias[0])
 
+            # this part makes no difference for batch dim chunking or sequence dim chunking
             # Accumulate gradients and loss
             grad_weight.add_(chunk_grad_weight)
             grad_inputs.append(chunk_grad_input)
@@ -121,12 +122,9 @@ class LigerFusedLinearGRPOBase(torch.autograd.Function):
         chunks = max(1, _input.shape[1] // chunk_size)
         _input_chunks = torch.chunk(_input, chunks=chunks, dim=1)
         _tokens_chunks = torch.chunk(tokens, chunks=chunks, dim=1)
+        _tokens_log_prob_chunks = torch.chunk(tokens_log_prob, chunks=chunks, dim=1)
         _tokens_mask_chunks = torch.chunk(tokens_mask, chunks=chunks, dim=1)
-        _tokens_log_prob_chunks = (
-            torch.chunk(tokens_log_prob, chunks=chunks, dim=1)
-            if tokens_log_prob is not None
-            else [None] * chunks
-        )
+           
 
         for (
             input_chunk,
@@ -142,8 +140,7 @@ class LigerFusedLinearGRPOBase(torch.autograd.Function):
             # Mark dynamic dimensions
             torch._dynamo.mark_dynamic(input_chunk, 1)
             torch._dynamo.mark_dynamic(tokens_chunk, 1)
-            if tokens_log_prob_chunk is not None:
-                torch._dynamo.mark_dynamic(tokens_log_prob_chunk, 1)
+            torch._dynamo.mark_dynamic(tokens_log_prob_chunk, 1)
             torch._dynamo.mark_dynamic(tokens_mask_chunk, 1)
             
             accumulate_chunk(
