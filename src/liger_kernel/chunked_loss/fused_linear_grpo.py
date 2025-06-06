@@ -266,7 +266,7 @@ class LigerFusedLinearGRPOFunction(LigerFusedLinearGRPOBase):
         # mask padding positions
         per_token_loss = per_token_loss * tokens_mask
         # Return sum without normalization - normalization handled in forward
-        loss = per_token_loss.sum()
+        loss = per_token_loss.sum().div(max_seq_len)
         return loss, []
     
     @classmethod

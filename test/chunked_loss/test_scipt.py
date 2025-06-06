@@ -56,7 +56,7 @@ class TorchLMHeadGRPO(torch.nn.Module):
         per_token_loss2 = coef_2 * advantages.unsqueeze(1)
         per_token_loss = -torch.min(per_token_loss1, per_token_loss2)
 
-        loss = (per_token_loss * tokens_mask).sum()
+        loss = (per_token_loss * tokens_mask).sum().div(self.max_seq_len)
 
         return loss, []
 
